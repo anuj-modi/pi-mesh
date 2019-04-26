@@ -8,14 +8,12 @@ from enum import IntEnum
 import threading
 import bson
 import socket
-import pyDH
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.asymmetric import rsa, padding, dh
-from cryptography.hazmat.primitives import padding as pd
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 TIMEOUT = 5
 
@@ -51,8 +49,12 @@ class Connection:
         self.node_connections = connections
         self.last_ts_received = 0
 
-        # Diffie-Hellman field
-        self.dh = None
+        # Diffie-Hellman fields
+        self.temp_priv_key = None
+        self.temp_pub_key = None
+        self.dh_parameters = None
+        self.salt = None
+        # self.timestamp = int(time.time())
 
     def initiate_connection(self):
         def go():
@@ -262,10 +264,28 @@ class Connection:
         """
 
         payload = dict()
+        if self.temp_priv_key is None and self.temp_pub_key is None \
+                and self.dh_parameters is None and self.salt is None:
+            # NOTE: the below command took a while in my Python console... will issue persist in actual implementation?
+            self.dh_parameters = dh.generate_parameters(
+                generator=2,
+                key_size=2048,
+                backend=default_backend()
+            )
+            self.temp_priv_key = self.dh_parameters.generate_private_key()
+            self.temp_pub_key = self.temp_priv_key.public_key()
+            self.salt = self.rng(16)
 
-        if self.dh is None:
-            self.dh = pyDH.DiffieHellman()
-        payload['dh_contribution'] = str(self.dh.gen_public_key())
+            payload['salt'] = self.salt
+
+            payload['dh_parameters'] = self.dh_parameters.parameter_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.ParameterFormat.PKCS3
+            )
+        payload['dh_contribution'] = self.temp_pub_key.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        )
 
         meta_payload = dict()
         meta_payload['type'] = "dh_contribution"
@@ -321,9 +341,8 @@ class Connection:
 
                 meta_payload = bson.loads(message['meta_payload'])
                 if meta_payload['prev_nonce'] != self.sent_nonce \
-                        or meta_payload['type'] != "dh_contribution" \
-                        or not self.is_ts_valid(meta_payload['timestamp']):
-                    print("continuing for invalid nonce, type, or timestamp")
+                        or meta_payload['type'] != "dh_contribution":
+                    print("continuing for invalid nonce or type")
                     continue
                 else:
                     # TODO awkward if-else-if-not logic, fix later?
@@ -359,11 +378,30 @@ class Connection:
         """
 
         try:
-            partner_temp_pub = int(meta_payload['payload']['dh_contribution'])
-            if self.dh is None:
-                self.dh = pyDH.DiffieHellman()
-            self.symmetric_key = AESGCM(bytes.fromhex(
-                self.dh.gen_shared_key(partner_temp_pub)))
+            partner_temp_pub = serialization.load_pem_public_key(
+                    meta_payload['payload']['dh_contribution'],
+                    backend=default_backend()
+            )
+            if self.temp_priv_key is None and self.temp_pub_key is None \
+                    and self.dh_parameters is None and self.salt is None:
+                self.dh_parameters = serialization.load_pem_parameters(
+                    meta_payload['payload']['dh_parameters'],
+                    backend=default_backend()
+                )
+                self.temp_priv_key = self.dh_parameters.generate_private_key()
+                self.temp_pub_key = self.temp_priv_key.public_key()
+
+                self.salt = meta_payload['payload']['salt']
+
+            self.symmetric_key = AESGCM(
+                HKDF(
+                    algorithm=hashes.SHA256(),
+                    length=32,
+                    salt=self.salt,
+                    info=None,
+                    backend=default_backend()
+                ).derive(self.temp_priv_key.exchange(partner_temp_pub))
+            )
             return True
 
         except Exception as e:
