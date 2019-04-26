@@ -1,0 +1,6 @@
+hostname: "A"
+ip: "172.17.0.2"
+port: 5555
+peers:
+  - hostname: "B"
+    ip: "172.17.0.3"
